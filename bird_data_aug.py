@@ -302,9 +302,17 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
     def resolve_table(col: exp.Column) -> Optional[str]:
         if not col.table:
             return None
-        # 兼容不同 sqlglot 版本：col.table 可能是 Identifier，也可能直接是 str
+
         t = col.table.name if hasattr(col.table, "name") else str(col.table)
-        return alias_map.get(t, t)
+        t = t.strip('"`[]')
+
+        # 兼容大小写别名
+        return (
+            alias_map.get(t)
+            or alias_map.get(t.lower())
+            or alias_map.get(t.upper())
+            or None   # 注意：不要回退成 t，否则会把别名当真实表
+        )
 
     for node in tree.find_all(exp.EQ):
         l, r = node.left, node.right
