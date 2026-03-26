@@ -302,7 +302,9 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
     def resolve_table(col: exp.Column) -> Optional[str]:
         if not col.table:
             return None
-        return alias_map.get(col.table.name, col.table.name)
+        # 兼容不同 sqlglot 版本：col.table 可能是 Identifier，也可能直接是 str
+        t = col.table.name if hasattr(col.table, "name") else str(col.table)
+        return alias_map.get(t, t)
 
     for node in tree.find_all(exp.EQ):
         l, r = node.left, node.right
