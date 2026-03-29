@@ -706,7 +706,16 @@ def do_A1_for_item(
     ev  = (item.get("evidence") or "").strip()
 
     tree, bindings = extract_bindings(sql)
+    first_skip_reason: Optional[str] = None
+
+    def mark_reason(reason: str) -> None:
+        nonlocal first_skip_reason
+        if first_skip_reason is None:
+            first_skip_reason = reason
+
     if tree is None or not bindings:
+        mark_reason("no_bindings_or_parse_failed")
+        print(f"[A1_SKIP] qid={item.get('question_id')} reason={first_skip_reason}")
         return []
 
     # Randomize binding order so different items explore different substitutions
@@ -725,6 +734,7 @@ def do_A1_for_item(
         else:
             table_candidates = fallback_tables
         if not table_candidates:
+            mark_reason(f"no_table_candidates_for_column:{b.column}")
             continue
         random.shuffle(table_candidates)
 
@@ -737,6 +747,7 @@ def do_A1_for_item(
                 pool = sampled
                 break
         if table is None or not pool:
+            mark_reason(f"no_sample_pool_for_column:{b.column}")
             continue
 
         for _ in range(16):
@@ -746,33 +757,41 @@ def do_A1_for_item(
             if b.op in {"=", "!=", ">", ">=", "<", "<="}:
                 new_v = random.choice([v for v, _ in pool])
                 if str(new_v) == str(b.old_values[0]):
+                    mark_reason("sampled_value_same_as_old")
                     continue
                 new_values = [new_v]
 
             elif b.op == "IN":
                 if len(pool) < len(b.old_values):
+                    mark_reason("insufficient_pool_for_in")
                     continue
                 new_values = [v for v, _ in random.sample(pool, k=len(b.old_values))]
 
             elif b.op == "BETWEEN":
                 if b.is_string and not allow_string_between:
+                    mark_reason("string_between_not_allowed")
                     continue
                 new_values = pick_between_values(pool, b.old_values[0], b.old_values[1], range_mode)
                 if new_values is None:
+                    mark_reason("between_sampling_failed")
                     continue
             else:
+                mark_reason(f"unsupported_op:{b.op}")
                 continue
 
             new_sql = rewrite_sql_by_binding(tree, b, new_values)
             norm = normalize_sql(new_sql).upper()
             if norm == normalize_sql(sql).upper():
+                mark_reason("rewritten_sql_same_as_original")
                 continue
             # Cross-item dedup: skip if this exact SQL was already generated for another item
             if norm in global_seen_sql:
+                mark_reason("dedup_sql_seen")
                 continue
 
             ok, rowcount, _ = exec_sql(conn, new_sql)
             if not ok or (require_non_empty and rowcount == 0):
+                mark_reason("sql_exec_failed_or_empty")
                 continue
 
             replaced = {
@@ -806,6 +825,7 @@ def do_A1_for_item(
                 if verify:
                     v_ok, v_reason = verify_alignment(client, model, schema_text, new_q, new_sql)
                     if not v_ok:
+                        mark_reason(f"verifier_reject:{v_reason}")
                         continue
                 else:
                     v_reason = ""
@@ -836,6 +856,7 @@ def do_A1_for_item(
                 if verify:
                     v_ok, v_reason = verify_alignment(client, model, schema_text, new_q, new_sql)
                     if not v_ok:
+                        mark_reason(f"verifier_reject:{v_reason}")
                         continue
                 else:
                     v_reason = ""
@@ -856,6 +877,9 @@ def do_A1_for_item(
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
+    if not out:
+        reason = first_skip_reason or "unknown"
+        print(f"[A1_SKIP] qid={item.get('question_id')} reason={reason}")
     return out
 
 
