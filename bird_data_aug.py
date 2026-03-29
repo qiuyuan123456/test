@@ -198,9 +198,14 @@ def find_candidate_tables_for_column(conn: sqlite3.Connection, column: str) -> L
     tables = [r["name"] for r in cur.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ).fetchall()]
-    return [t for t in tables
-            if column in [r["name"] for r in cur.execute(
-                f"PRAGMA table_info({safe_ident(t)})").fetchall()]]
+    target = str(column).strip('"`[]').lower()
+    out: List[str] = []
+    for t in tables:
+        cols = [str(r["name"]).strip('"`[]').lower()
+                for r in cur.execute(f"PRAGMA table_info({safe_ident(t)})").fetchall()]
+        if target in cols:
+            out.append(t)
+    return out
 
 
 def sample_values_by_freq(
@@ -279,7 +284,7 @@ def build_alias_map(tree: exp.Expression) -> Dict[str, str]:
 class Binding:
     resolved_table: Optional[str]
     column: str
-    op: str                          # '=', 'IN', 'BETWEEN'
+    op: str                          # '=', '!=', '>', '>=', '<', '<=', 'IN', 'BETWEEN'
     old_values: List[Any]
     is_string: bool
     literal_nodes: List[exp.Literal] # direct AST node refs for surgical replacement
@@ -314,12 +319,23 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
             or None   # 注意：不要回退成 t，否则会把别名当真实表
         )
 
-    for node in tree.find_all(exp.EQ):
-        l, r = node.left, node.right
-        if isinstance(l, exp.Column) and isinstance(r, exp.Literal):
-            bindings.append(Binding(resolve_table(l), l.name, "=", [r.this], r.is_string, [r]))
-        elif isinstance(r, exp.Column) and isinstance(l, exp.Literal):
-            bindings.append(Binding(resolve_table(r), r.name, "=", [l.this], l.is_string, [l]))
+    # Single-literal binary predicates
+    # (A1 originally focused on '=', now expanded to include common comparison operators)
+    binary_ops: List[Tuple[Any, str]] = [
+        (exp.EQ, "="),
+        (exp.NEQ, "!="),
+        (exp.GT, ">"),
+        (exp.GTE, ">="),
+        (exp.LT, "<"),
+        (exp.LTE, "<="),
+    ]
+    for op_cls, op_name in binary_ops:
+        for node in tree.find_all(op_cls):
+            l, r = node.left, node.right
+            if isinstance(l, exp.Column) and isinstance(r, exp.Literal):
+                bindings.append(Binding(resolve_table(l), l.name, op_name, [r.this], r.is_string, [r]))
+            elif isinstance(r, exp.Column) and isinstance(l, exp.Literal):
+                bindings.append(Binding(resolve_table(r), r.name, op_name, [l.this], l.is_string, [l]))
 
     for node in tree.find_all(exp.In):
         if isinstance(node.this, exp.Column):
@@ -621,6 +637,23 @@ def llm_json(
     raise last_exc
 
 
+def _replace_literal_mentions(text: str, old_values: List[Any], new_values: List[Any]) -> str:
+    """
+    Best-effort textual replacement used as a fallback when A1 LLM rewriting fails.
+    Replaces quoted and unquoted literal mentions; if no match exists, text is unchanged.
+    """
+    out = text
+    for old_v, new_v in zip(old_values, new_values):
+        old_s = str(old_v)
+        new_s = str(new_v)
+        # Replace quoted forms first
+        out = out.replace(f"'{old_s}'", f"'{new_s}'")
+        out = out.replace(f"\"{old_s}\"", f"\"{new_s}\"")
+        # Then replace standalone occurrences (number/code tokens)
+        out = re.sub(rf"(?<!\w){re.escape(old_s)}(?!\w)", new_s, out)
+    return out
+
+
 def verify_alignment(
     client: OpenAI,
     model: str,
@@ -673,7 +706,16 @@ def do_A1_for_item(
     ev  = (item.get("evidence") or "").strip()
 
     tree, bindings = extract_bindings(sql)
+    first_skip_reason: Optional[str] = None
+
+    def mark_reason(reason: str) -> None:
+        nonlocal first_skip_reason
+        if first_skip_reason is None:
+            first_skip_reason = reason
+
     if tree is None or not bindings:
+        mark_reason("no_bindings_or_parse_failed")
+        print(f"[A1_SKIP] qid={item.get('question_id')} reason={first_skip_reason}")
         return []
 
     # Randomize binding order so different items explore different substitutions
@@ -684,50 +726,72 @@ def do_A1_for_item(
         if len(out) >= max_aug_per_item:
             break
 
-        table_candidates = ([b.resolved_table] if b.resolved_table
-                            else find_candidate_tables_for_column(conn, b.column))
+        fallback_tables = find_candidate_tables_for_column(conn, b.column)
+        if b.resolved_table:
+            # Even when alias resolution gives a table, keep fallback candidates.
+            # Complex SQL/subqueries can produce imperfect table resolution.
+            table_candidates = [b.resolved_table] + [t for t in fallback_tables if t != b.resolved_table]
+        else:
+            table_candidates = fallback_tables
         if not table_candidates:
+            mark_reason(f"no_table_candidates_for_column:{b.column}")
             continue
-        table = random.choice(table_candidates)
+        random.shuffle(table_candidates)
 
-        pool = sample_values_by_freq(conn, table, b.column, k=24)
-        if not pool:
+        table = None
+        pool: List[Tuple[Any, int]] = []
+        for t in table_candidates:
+            sampled = sample_values_by_freq(conn, t, b.column, k=24)
+            if sampled:
+                table = t
+                pool = sampled
+                break
+        if table is None or not pool:
+            mark_reason(f"no_sample_pool_for_column:{b.column}")
             continue
 
         for _ in range(16):
             if len(out) >= max_aug_per_item:
                 break
 
-            if b.op == "=":
+            if b.op in {"=", "!=", ">", ">=", "<", "<="}:
                 new_v = random.choice([v for v, _ in pool])
                 if str(new_v) == str(b.old_values[0]):
+                    mark_reason("sampled_value_same_as_old")
                     continue
                 new_values = [new_v]
 
             elif b.op == "IN":
                 if len(pool) < len(b.old_values):
+                    mark_reason("insufficient_pool_for_in")
                     continue
                 new_values = [v for v, _ in random.sample(pool, k=len(b.old_values))]
 
             elif b.op == "BETWEEN":
                 if b.is_string and not allow_string_between:
+                    mark_reason("string_between_not_allowed")
                     continue
                 new_values = pick_between_values(pool, b.old_values[0], b.old_values[1], range_mode)
                 if new_values is None:
+                    mark_reason("between_sampling_failed")
                     continue
             else:
+                mark_reason(f"unsupported_op:{b.op}")
                 continue
 
             new_sql = rewrite_sql_by_binding(tree, b, new_values)
             norm = normalize_sql(new_sql).upper()
             if norm == normalize_sql(sql).upper():
+                mark_reason("rewritten_sql_same_as_original")
                 continue
             # Cross-item dedup: skip if this exact SQL was already generated for another item
             if norm in global_seen_sql:
+                mark_reason("dedup_sql_seen")
                 continue
 
             ok, rowcount, _ = exec_sql(conn, new_sql)
             if not ok or (require_non_empty and rowcount == 0):
+                mark_reason("sql_exec_failed_or_empty")
                 continue
 
             replaced = {
@@ -752,12 +816,16 @@ def do_A1_for_item(
                 # Keep LLM-updated evidence if provided; fall back to original otherwise
                 new_ev = str(gen.get("new_evidence", ev)).strip() or ev
 
-                if not new_q or new_q.lower() == q.lower():
-                    continue
+                if not new_q:
+                    # Fallback: if model returns malformed/empty new_question, keep question text
+                    # and only do deterministic literal mention replacement.
+                    new_q = _replace_literal_mentions(q, b.old_values, new_values)
+                    new_ev = _replace_literal_mentions(new_ev, b.old_values, new_values) if ev else new_ev
 
                 if verify:
                     v_ok, v_reason = verify_alignment(client, model, schema_text, new_q, new_sql)
                     if not v_ok:
+                        mark_reason(f"verifier_reject:{v_reason}")
                         continue
                 else:
                     v_reason = ""
@@ -781,8 +849,37 @@ def do_A1_for_item(
                     time.sleep(sleep_s)
 
             except Exception:
-                continue
+                # Fallback path: keep augmentation even if A1 rewriting call fails.
+                # This avoids all-A1-zero runs due to transient API issues.
+                new_q = _replace_literal_mentions(q, b.old_values, new_values)
+                new_ev = _replace_literal_mentions(ev, b.old_values, new_values) if ev else ev
+                if verify:
+                    v_ok, v_reason = verify_alignment(client, model, schema_text, new_q, new_sql)
+                    if not v_ok:
+                        mark_reason(f"verifier_reject:{v_reason}")
+                        continue
+                else:
+                    v_reason = ""
 
+                global_seen_sql.add(norm)
+                aug = dict(item)
+                aug["question"]           = new_q
+                aug["query"]              = new_sql
+                if ev:
+                    aug["evidence"]       = new_ev
+                aug["aug_type"]           = "A1_value_substitution"
+                aug["source_question_id"] = item.get("question_id")
+                aug["replaced"]           = replaced
+                aug["exec_rowcount"]      = rowcount
+                if verify:
+                    aug["verifier_reason"] = v_reason
+                out.append(aug)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+
+    if not out:
+        reason = first_skip_reason or "unknown"
+        print(f"[A1_SKIP] qid={item.get('question_id')} reason={reason}")
     return out
 
 
