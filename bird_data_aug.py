@@ -198,9 +198,14 @@ def find_candidate_tables_for_column(conn: sqlite3.Connection, column: str) -> L
     tables = [r["name"] for r in cur.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ).fetchall()]
-    return [t for t in tables
-            if column in [r["name"] for r in cur.execute(
-                f"PRAGMA table_info({safe_ident(t)})").fetchall()]]
+    target = str(column).strip('"`[]').lower()
+    out: List[str] = []
+    for t in tables:
+        cols = [str(r["name"]).strip('"`[]').lower()
+                for r in cur.execute(f"PRAGMA table_info({safe_ident(t)})").fetchall()]
+        if target in cols:
+            out.append(t)
+    return out
 
 
 def sample_values_by_freq(
@@ -695,14 +700,26 @@ def do_A1_for_item(
         if len(out) >= max_aug_per_item:
             break
 
-        table_candidates = ([b.resolved_table] if b.resolved_table
-                            else find_candidate_tables_for_column(conn, b.column))
+        fallback_tables = find_candidate_tables_for_column(conn, b.column)
+        if b.resolved_table:
+            # Even when alias resolution gives a table, keep fallback candidates.
+            # Complex SQL/subqueries can produce imperfect table resolution.
+            table_candidates = [b.resolved_table] + [t for t in fallback_tables if t != b.resolved_table]
+        else:
+            table_candidates = fallback_tables
         if not table_candidates:
             continue
-        table = random.choice(table_candidates)
+        random.shuffle(table_candidates)
 
-        pool = sample_values_by_freq(conn, table, b.column, k=24)
-        if not pool:
+        table = None
+        pool: List[Tuple[Any, int]] = []
+        for t in table_candidates:
+            sampled = sample_values_by_freq(conn, t, b.column, k=24)
+            if sampled:
+                table = t
+                pool = sampled
+                break
+        if table is None or not pool:
             continue
 
         for _ in range(16):
