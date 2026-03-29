@@ -279,7 +279,7 @@ def build_alias_map(tree: exp.Expression) -> Dict[str, str]:
 class Binding:
     resolved_table: Optional[str]
     column: str
-    op: str                          # '=', 'IN', 'BETWEEN'
+    op: str                          # '=', '!=', '>', '>=', '<', '<=', 'IN', 'BETWEEN'
     old_values: List[Any]
     is_string: bool
     literal_nodes: List[exp.Literal] # direct AST node refs for surgical replacement
@@ -314,12 +314,23 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
             or None   # 注意：不要回退成 t，否则会把别名当真实表
         )
 
-    for node in tree.find_all(exp.EQ):
-        l, r = node.left, node.right
-        if isinstance(l, exp.Column) and isinstance(r, exp.Literal):
-            bindings.append(Binding(resolve_table(l), l.name, "=", [r.this], r.is_string, [r]))
-        elif isinstance(r, exp.Column) and isinstance(l, exp.Literal):
-            bindings.append(Binding(resolve_table(r), r.name, "=", [l.this], l.is_string, [l]))
+    # Single-literal binary predicates
+    # (A1 originally focused on '=', now expanded to include common comparison operators)
+    binary_ops: List[Tuple[Any, str]] = [
+        (exp.EQ, "="),
+        (exp.NEQ, "!="),
+        (exp.GT, ">"),
+        (exp.GTE, ">="),
+        (exp.LT, "<"),
+        (exp.LTE, "<="),
+    ]
+    for op_cls, op_name in binary_ops:
+        for node in tree.find_all(op_cls):
+            l, r = node.left, node.right
+            if isinstance(l, exp.Column) and isinstance(r, exp.Literal):
+                bindings.append(Binding(resolve_table(l), l.name, op_name, [r.this], r.is_string, [r]))
+            elif isinstance(r, exp.Column) and isinstance(l, exp.Literal):
+                bindings.append(Binding(resolve_table(r), r.name, op_name, [l.this], l.is_string, [l]))
 
     for node in tree.find_all(exp.In):
         if isinstance(node.this, exp.Column):
@@ -698,7 +709,7 @@ def do_A1_for_item(
             if len(out) >= max_aug_per_item:
                 break
 
-            if b.op == "=":
+            if b.op in {"=", "!=", ">", ">=", "<", "<="}:
                 new_v = random.choice([v for v, _ in pool])
                 if str(new_v) == str(b.old_values[0]):
                     continue
