@@ -637,6 +637,23 @@ def llm_json(
     raise last_exc
 
 
+def _replace_literal_mentions(text: str, old_values: List[Any], new_values: List[Any]) -> str:
+    """
+    Best-effort textual replacement used as a fallback when A1 LLM rewriting fails.
+    Replaces quoted and unquoted literal mentions; if no match exists, text is unchanged.
+    """
+    out = text
+    for old_v, new_v in zip(old_values, new_values):
+        old_s = str(old_v)
+        new_s = str(new_v)
+        # Replace quoted forms first
+        out = out.replace(f"'{old_s}'", f"'{new_s}'")
+        out = out.replace(f"\"{old_s}\"", f"\"{new_s}\"")
+        # Then replace standalone occurrences (number/code tokens)
+        out = re.sub(rf"(?<!\w){re.escape(old_s)}(?!\w)", new_s, out)
+    return out
+
+
 def verify_alignment(
     client: OpenAI,
     model: str,
@@ -780,8 +797,11 @@ def do_A1_for_item(
                 # Keep LLM-updated evidence if provided; fall back to original otherwise
                 new_ev = str(gen.get("new_evidence", ev)).strip() or ev
 
-                if not new_q or new_q.lower() == q.lower():
-                    continue
+                if not new_q:
+                    # Fallback: if model returns malformed/empty new_question, keep question text
+                    # and only do deterministic literal mention replacement.
+                    new_q = _replace_literal_mentions(q, b.old_values, new_values)
+                    new_ev = _replace_literal_mentions(new_ev, b.old_values, new_values) if ev else new_ev
 
                 if verify:
                     v_ok, v_reason = verify_alignment(client, model, schema_text, new_q, new_sql)
@@ -809,7 +829,32 @@ def do_A1_for_item(
                     time.sleep(sleep_s)
 
             except Exception:
-                continue
+                # Fallback path: keep augmentation even if A1 rewriting call fails.
+                # This avoids all-A1-zero runs due to transient API issues.
+                new_q = _replace_literal_mentions(q, b.old_values, new_values)
+                new_ev = _replace_literal_mentions(ev, b.old_values, new_values) if ev else ev
+                if verify:
+                    v_ok, v_reason = verify_alignment(client, model, schema_text, new_q, new_sql)
+                    if not v_ok:
+                        continue
+                else:
+                    v_reason = ""
+
+                global_seen_sql.add(norm)
+                aug = dict(item)
+                aug["question"]           = new_q
+                aug["query"]              = new_sql
+                if ev:
+                    aug["evidence"]       = new_ev
+                aug["aug_type"]           = "A1_value_substitution"
+                aug["source_question_id"] = item.get("question_id")
+                aug["replaced"]           = replaced
+                aug["exec_rowcount"]      = rowcount
+                if verify:
+                    aug["verifier_reason"] = v_reason
+                out.append(aug)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
 
     return out
 
