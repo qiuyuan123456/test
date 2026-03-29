@@ -707,11 +707,14 @@ def do_A1_for_item(
 
     tree, bindings = extract_bindings(sql)
     first_skip_reason: Optional[str] = None
+    first_skip_detail: Optional[Dict[str, Any]] = None
 
-    def mark_reason(reason: str) -> None:
+    def mark_reason(reason: str, detail: Optional[Dict[str, Any]] = None) -> None:
         nonlocal first_skip_reason
+        nonlocal first_skip_detail
         if first_skip_reason is None:
             first_skip_reason = reason
+            first_skip_detail = detail
 
     if tree is None or not bindings:
         mark_reason("no_bindings_or_parse_failed")
@@ -782,7 +785,17 @@ def do_A1_for_item(
             new_sql = rewrite_sql_by_binding(tree, b, new_values)
             norm = normalize_sql(new_sql).upper()
             if norm == normalize_sql(sql).upper():
-                mark_reason("rewritten_sql_same_as_original")
+                mark_reason(
+                    "rewritten_sql_same_as_original",
+                    {
+                        "column": f"{table}.{b.column}",
+                        "op": b.op,
+                        "old_values": [str(x) for x in b.old_values],
+                        "new_values": [str(x) for x in new_values],
+                        "sql": sql,
+                        "new_sql": new_sql,
+                    },
+                )
                 continue
             # Cross-item dedup: skip if this exact SQL was already generated for another item
             if norm in global_seen_sql:
@@ -880,6 +893,11 @@ def do_A1_for_item(
     if not out:
         reason = first_skip_reason or "unknown"
         print(f"[A1_SKIP] qid={item.get('question_id')} reason={reason}")
+        if first_skip_detail:
+            print(
+                "[A1_SKIP_DETAIL] "
+                f"qid={item.get('question_id')} detail={json.dumps(first_skip_detail, ensure_ascii=False)}"
+            )
     return out
 
 
