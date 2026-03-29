@@ -288,6 +288,7 @@ class Binding:
     old_values: List[Any]
     is_string: bool
     literal_nodes: List[exp.Literal] # direct AST node refs for surgical replacement
+    literal_positions: List[int]     # stable literal order indices in parsed tree
 
 
 def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]:
@@ -303,6 +304,7 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
 
     alias_map = build_alias_map(tree)
     bindings: List[Binding] = []
+    literal_order: Dict[int, int] = {id(n): i for i, n in enumerate(tree.find_all(exp.Literal))}
 
     def resolve_table(col: exp.Column) -> Optional[str]:
         if not col.table:
@@ -333,9 +335,15 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
         for node in tree.find_all(op_cls):
             l, r = node.left, node.right
             if isinstance(l, exp.Column) and isinstance(r, exp.Literal):
-                bindings.append(Binding(resolve_table(l), l.name, op_name, [r.this], r.is_string, [r]))
+                bindings.append(Binding(
+                    resolve_table(l), l.name, op_name, [r.this], r.is_string, [r],
+                    [literal_order[id(r)]],
+                ))
             elif isinstance(r, exp.Column) and isinstance(l, exp.Literal):
-                bindings.append(Binding(resolve_table(r), r.name, op_name, [l.this], l.is_string, [l]))
+                bindings.append(Binding(
+                    resolve_table(r), r.name, op_name, [l.this], l.is_string, [l],
+                    [literal_order[id(l)]],
+                ))
 
     for node in tree.find_all(exp.In):
         if isinstance(node.this, exp.Column):
@@ -352,7 +360,9 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
                 is_str = is_str or e.is_string
             if ok and lits:
                 bindings.append(Binding(
-                    resolve_table(node.this), node.this.name, "IN", vals, is_str, lits))
+                    resolve_table(node.this), node.this.name, "IN", vals, is_str, lits,
+                    [literal_order[id(x)] for x in lits],
+                ))
 
     for node in tree.find_all(exp.Between):
         if isinstance(node.this, exp.Column):
@@ -362,6 +372,7 @@ def extract_bindings(sql: str) -> Tuple[Optional[exp.Expression], List[Binding]]
                 bindings.append(Binding(
                     resolve_table(node.this), node.this.name, "BETWEEN",
                     [low.this, high.this], low.is_string or high.is_string, [low, high],
+                    [literal_order[id(low)], literal_order[id(high)]],
                 ))
 
     return tree, bindings
@@ -379,12 +390,21 @@ def rewrite_sql_by_binding(tree: exp.Expression, binding: Binding, new_values: L
     tree.transform() returns a deep copy, so the original AST is unchanged and we can
     safely reuse it for other bindings within the same item.
     """
-    if len(binding.literal_nodes) != len(new_values):
+    if len(binding.literal_positions) != len(new_values):
         return tree.sql(dialect="sqlite")
 
-    idx_map = {id(n): make_literal(v, binding.is_string)
-               for n, v in zip(binding.literal_nodes, new_values)}
-    new_tree = tree.transform(lambda node: idx_map.get(id(node), node))
+    pos_map = {p: make_literal(v, binding.is_string)
+               for p, v in zip(binding.literal_positions, new_values)}
+    lit_i = -1
+
+    def replace_by_position(node: exp.Expression) -> exp.Expression:
+        nonlocal lit_i
+        if isinstance(node, exp.Literal):
+            lit_i += 1
+            return pos_map.get(lit_i, node)
+        return node
+
+    new_tree = tree.transform(replace_by_position)
     return new_tree.sql(dialect="sqlite")
 
 
